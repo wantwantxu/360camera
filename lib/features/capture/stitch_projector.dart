@@ -15,10 +15,14 @@ import '../../core/utils/angle_utils.dart';
 /// zero-mean normalised cross-correlation search over yaw/pitch/roll (the
 /// direct photometric approach from Szeliski's stitching tutorial) absorbs
 /// compass drift, while a least-squares per-channel gain+offset match (Brown &
-/// Lowe gain compensation) evens out exposure. Overlaps use a narrow seam (the
-/// strongest frame wins) instead of averaging the whole overlap, so residual
-/// attitude error cannot paint double edges across the image; flat regions
-/// fall back to a smooth blend.
+/// Lowe gain compensation) evens out exposure. Callers may supply a second
+/// yaw candidate (the gyroscope-predicted heading): a pure-rotation panorama is
+/// a photometric registration problem, so the candidate that explains the
+/// existing mosaic better seeds the search — the gyro is a prior, never an
+/// authority. Overlaps use a narrow seam (the strongest frame wins, with
+/// equal-coverage pixels resolving to the newest frame) instead of averaging
+/// the whole overlap, so residual attitude error cannot paint double edges
+/// across the image; flat regions fall back to a smooth blend.
 class StitchProjector {
   StitchProjector({
     this.width = PanoConstants.stitchWidth4k,
@@ -100,6 +104,7 @@ class StitchProjector {
     required double yawDeg,
     required double pitchDeg,
     double rollDeg = 0,
+    double? altYawDeg,
   }) {
     final oriented = img.bakeOrientation(source);
     projectRgba(
@@ -109,10 +114,15 @@ class StitchProjector {
       yawDeg: yawDeg,
       pitchDeg: pitchDeg,
       rollDeg: rollDeg,
+      altYawDeg: altYawDeg,
     );
   }
 
   /// Projects raw RGBA pixels (already orientation-normalised).
+  ///
+  /// [altYawDeg] is an optional independent yaw estimate for the same frame
+  /// (the gyroscope-predicted heading). When supplied, both poses are scored
+  /// against the existing mosaic and the better one seeds the refinement.
   void projectRgba({
     required Uint8List rgba,
     required int imageWidth,
@@ -120,6 +130,7 @@ class StitchProjector {
     required double yawDeg,
     required double pitchDeg,
     double rollDeg = 0,
+    double? altYawDeg,
   }) {
     if (imageWidth < 8 ||
         imageHeight < 8 ||
@@ -161,6 +172,7 @@ class StitchProjector {
         imageWidth: imageWidth,
         imageHeight: imageHeight,
         fallbackGain: fallbackGain,
+        altYawDeg: altYawDeg,
       );
     }
     debugLastYawDeltaDeg = fix.dYawDeg;
@@ -168,6 +180,10 @@ class StitchProjector {
     debugLastRollDeltaDeg = fix.dRollDeg;
     debugLastShiftX = (fix.dYawDeg / 360 * width).round();
     debugLastShiftY = (-fix.dPitchDeg / 180 * height).round();
+    // Deep-overlap ties resolve to the newest frame only when the frame has
+    // texture worth keeping; flat frames keep the smooth average so pure
+    // exposure differences never turn into a winner-take-all step.
+    final tieBias = fix.frameVarS >= 9 ? 0.5 : 0.0;
 
     final geo = fix.dYawDeg == 0 && fix.dPitchDeg == 0 && fix.dRollDeg == 0
         ? base
@@ -272,8 +288,12 @@ class StitchProjector {
           _rgba[oi + 2] = patchRgb[pi + 2];
         } else {
           // Winner-take-all with a narrow transition band, so a few degrees of
-          // residual attitude error cannot paint a wide double image.
-          final t = (0.5 + (w - prevW) / 0.12).clamp(0.0, 1.0);
+          // residual attitude error cannot paint a wide double image. For
+          // textured frames the bias resolves equal-coverage pixels to the
+          // newest frame instead of averaging two frames 50/50, which would
+          // halve texture contrast (a soft double image) across deep overlap
+          // interiors; flat frames keep the plain 50/50 average.
+          final t = (0.5 + tieBias + (w - prevW) / 0.12).clamp(0.0, 1.0);
           final seam = t * t * (3 - 2 * t);
           final smooth = w / (prevW + w);
           final diff = diffMap == null ? 255 : diffMap[rowBase + px];
@@ -603,6 +623,11 @@ class StitchProjector {
   /// Brown & Lowe's gain compensation. A correction is only accepted when it
   /// explains noticeably more of the overlap, which stops low-texture or
   /// repetitive walls from inventing one.
+  ///
+  /// [altYawDeg] is an independent yaw estimate (gyro-predicted heading) for
+  /// the same frame. Both candidate poses are scored on the overlap; the one
+  /// with the higher ZNCC seeds the search, so a wrong candidate is simply
+  /// ignored instead of moving the frame.
   _OrientationFix _refineOrientation({
     required _PoseGeometry base,
     required double yawDeg,
@@ -614,6 +639,7 @@ class StitchProjector {
     required int imageWidth,
     required int imageHeight,
     required double fallbackGain,
+    double? altYawDeg,
   }) {
     final fallback = _OrientationFix(
       gainR: fallbackGain,
@@ -626,23 +652,33 @@ class StitchProjector {
     final rayZ = <double>[];
     final canvasLuma = <double>[];
     final canvasIndex = <int>[];
-    for (var py = 0; py < base.bh; py += stride) {
-      final cy = base.y0 + py;
-      if (cy < 0 || cy >= height) continue;
-      final lat = 90 - (cy + 0.5) / height * 180;
-      final latR = degToRad(lat);
-      final sinLat = math.sin(latR);
-      final cosLat = math.cos(latR);
-      for (var px = 0; px < base.bw; px += stride) {
-        final cx = ((base.x0 + px) % width + width) % width;
-        final ci = cy * width + cx;
-        if (_weights[ci] < 0.25) continue;
-        rayX.add(cosLat * _sinLon[cx]);
-        rayY.add(sinLat);
-        rayZ.add(cosLat * _cosLon[cx]);
-        canvasLuma.add(_rgbaLuma(ci).toDouble());
-        canvasIndex.add(ci);
+    void collectRays(_PoseGeometry geo) {
+      for (var py = 0; py < geo.bh; py += stride) {
+        final cy = geo.y0 + py;
+        if (cy < 0 || cy >= height) continue;
+        final lat = 90 - (cy + 0.5) / height * 180;
+        final latR = degToRad(lat);
+        final sinLat = math.sin(latR);
+        final cosLat = math.cos(latR);
+        for (var px = 0; px < geo.bw; px += stride) {
+          final cx = ((geo.x0 + px) % width + width) % width;
+          final ci = cy * width + cx;
+          if (_weights[ci] < 0.25) continue;
+          rayX.add(cosLat * _sinLon[cx]);
+          rayY.add(sinLat);
+          rayZ.add(cosLat * _cosLon[cx]);
+          canvasLuma.add(_rgbaLuma(ci).toDouble());
+          canvasIndex.add(ci);
+        }
       }
+    }
+
+    collectRays(base);
+    final altNorm = altYawDeg == null ? null : normalizeDeg360(altYawDeg);
+    final altOffset = altNorm == null ? 0.0 : normalizeDeg180(altNorm - yawDeg);
+    if (altNorm != null && altOffset.abs() > 1.5) {
+      final altGeo = _geometryFor(altNorm, pitchDeg, rollDeg, tanH, tanV);
+      if (altGeo.bw >= 4 && altGeo.bh >= 4) collectRays(altGeo);
     }
     final total = rayX.length;
     if (total < 150) return fallback;
@@ -690,9 +726,20 @@ class StitchProjector {
       return (corr: corr, used: n, varC: varC, varS: varS);
     }
 
-    final zero = evaluate(yawDeg, pitchDeg, rollDeg);
-    if (zero == null || zero.varC < 9 || zero.varS < 9) return fallback;
-    final minUsed = (zero.used * 0.7).ceil();
+    var startYaw = yawDeg;
+    var zero = evaluate(yawDeg, pitchDeg, rollDeg);
+    var zeroUsable = zero != null && zero.varC >= 9 && zero.varS >= 9;
+    if (altNorm != null && altOffset.abs() > 1.5) {
+      final altZero = evaluate(altNorm, pitchDeg, rollDeg);
+      final altUsable = altZero != null && altZero.varC >= 9 && altZero.varS >= 9;
+      if (altUsable && (!zeroUsable || altZero.corr > zero.corr + 0.01)) {
+        startYaw = altNorm;
+        zero = altZero;
+        zeroUsable = true;
+      }
+    }
+    if (!zeroUsable) return fallback;
+    final minUsed = (zero!.used * 0.7).ceil();
 
     var bestCorr = zero.corr;
     var bestYaw = 0.0;
@@ -701,7 +748,7 @@ class StitchProjector {
     void consider(double dYaw, double dPitch, double dRoll) {
       if (dYaw == 0 && dPitch == 0 && dRoll == 0) return;
       final result =
-          evaluate(yawDeg + dYaw, pitchDeg + dPitch, rollDeg + dRoll);
+          evaluate(startYaw + dYaw, pitchDeg + dPitch, rollDeg + dRoll);
       if (result == null || result.used < minUsed) return;
       if (result.corr > bestCorr + 1e-9) {
         bestCorr = result.corr;
@@ -747,8 +794,11 @@ class StitchProjector {
     }
 
     // Per-channel gain+offset on the overlap at the refined pose.
-    final b =
-        _basisFor(yawDeg + bestYaw, pitchDeg + bestPitch, rollDeg + bestRoll);
+    final b = _basisFor(
+      startYaw + bestYaw,
+      pitchDeg + bestPitch,
+      rollDeg + bestRoll,
+    );
     final gains = <double>[fallbackGain, fallbackGain, fallbackGain];
     final offsets = <double>[0.0, 0.0, 0.0];
     final sumS = <double>[0.0, 0.0, 0.0];
@@ -799,9 +849,10 @@ class StitchProjector {
     }
 
     return _OrientationFix(
-      dYawDeg: bestYaw,
+      dYawDeg: normalizeDeg180(startYaw - yawDeg) + bestYaw,
       dPitchDeg: bestPitch,
       dRollDeg: bestRoll,
+      frameVarS: zero.varS,
       gainR: gains[0],
       offsetR: offsets[0],
       gainG: gains[1],
@@ -898,6 +949,7 @@ class _OrientationFix {
     this.offsetG = 0,
     this.gainB = 1,
     this.offsetB = 0,
+    this.frameVarS = 0,
   });
 
   final double dYawDeg;
@@ -909,4 +961,7 @@ class _OrientationFix {
   final double offsetG;
   final double gainB;
   final double offsetB;
+
+  /// Luma variance of the frame over the measured overlap (texture strength).
+  final double frameVarS;
 }

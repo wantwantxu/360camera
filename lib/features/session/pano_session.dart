@@ -17,6 +17,7 @@ import '../../core/constants.dart';
 import '../../core/utils/angle_utils.dart';
 import '../../core/utils/attitude_filter.dart';
 import '../../core/utils/compass_utils.dart';
+import '../../core/utils/gyro_heading.dart';
 import '../../data/gallery_repository.dart';
 import '../../domain/app_enums.dart';
 import '../../domain/capture_matrix.dart';
@@ -191,6 +192,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   CameraController? cameraController;
   StreamSubscription<MagnetometerEvent>? _magSub;
   StreamSubscription<AccelerometerEvent>? _accSub;
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
   Timer? _tick;
   Timer? _toastTimer;
   Timer? _flashTimer;
@@ -202,6 +204,11 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   AccelerometerEvent? _lastAcc;
   MagnetometerEvent? _lastMag;
   final AttitudeFilter _attitude = AttitudeFilter();
+  final GyroHeadingTracker _gyro = GyroHeadingTracker();
+
+  /// Panorama yaw the gyro track was zeroed at; null when no gyro candidate
+  /// should be offered to the stitcher.
+  double? _gyroAnchorYawDeg;
   DateTime? _lastAttitudeAt;
   bool _userDragging = false;
   bool _capturingFrame = false;
@@ -390,9 +397,12 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   void _startSensors() {
     _magSub?.cancel();
     _accSub?.cancel();
+    _gyroSub?.cancel();
     _lastMag = null;
     _lastAcc = null;
     _lastAttitudeAt = null;
+    _gyro.reset();
+    _gyroAnchorYawDeg = null;
     _magSub = magnetometerEventStream(
       samplingPeriod: SensorInterval.gameInterval,
     ).listen((e) {
@@ -405,15 +415,58 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
       _lastAcc = e;
       _updateAttitudeFromSensors();
     });
+    _gyroSub = gyroscopeEventStream(
+      samplingPeriod: SensorInterval.gameInterval,
+    ).listen(_onGyroSample);
   }
 
   void _stopSensors() {
     _magSub?.cancel();
     _accSub?.cancel();
+    _gyroSub?.cancel();
     _magSub = null;
     _accSub = null;
+    _gyroSub = null;
     _lastAttitudeAt = null;
     _attitude.clear();
+    _gyro.reset();
+    _gyroAnchorYawDeg = null;
+  }
+
+  /// Integrates a gyro sample into the heading track that feeds the stitcher.
+  ///
+  /// The track is only a prior: capture passes it to the stitcher as a second
+  /// yaw candidate and the photometric registration decides which pose the
+  /// frame actually sits at, so a drifting or mis-signed track cannot corrupt
+  /// the panorama.
+  void _onGyroSample(GyroscopeEvent e) {
+    final acc = _lastAcc;
+    if (acc == null) return;
+    final len = math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+    if (len < 0.5) return;
+    _gyro.addSample(
+      timestamp: e.timestamp,
+      gx: e.x,
+      gy: e.y,
+      gz: e.z,
+      upX: acc.x / len,
+      upY: acc.y / len,
+      upZ: acc.z / len,
+    );
+  }
+
+  /// Gyro-predicted capture yaw, or null when there is no trustworthy track.
+  ///
+  /// The 45° agreement gate rejects tracks that diverged grossly from the
+  /// compass (e.g. a world-frame sign mistake after the user spun around);
+  /// ordinary compass error indoors is far below this and is resolved by the
+  /// stitcher's candidate scoring instead.
+  double? _gyroCandidateYaw(double filteredYaw) {
+    final anchor = _gyroAnchorYawDeg;
+    if (anchor == null || _gyro.samples < 30) return null;
+    final yaw = normalizeDeg360(anchor + _gyro.headingDeg);
+    if (normalizeDeg180(yaw - filteredYaw).abs() > 45) return null;
+    return yaw;
   }
 
   /// Feeds raw sensors through the smoothing filter. UI state is only published
@@ -505,6 +558,10 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
         _magYawOffset = normalizeDeg360(state.yaw - reading.headingDeg);
       }
     }
+    // A drag is a virtual-gimbal move, not a physical rotation: restart the
+    // gyro track from the dragged view so later captures stay consistent.
+    _gyro.reset();
+    _gyroAnchorYawDeg = state.yaw;
     _attitude.snapTo(yaw: state.yaw, pitch: state.pitch, roll: state.roll);
   }
 
@@ -715,6 +772,11 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     final captureYaw = state.yaw;
     final capturePitch = state.pitch;
     final captureRoll = state.roll;
+    // Independent gyro-predicted yaw for this frame; the stitcher keeps
+    // whichever of the two candidates matches the mosaic better.
+    final altYaw = state.source == CaptureSource.camera
+        ? _gyroCandidateYaw(captureYaw)
+        : null;
     _capturingFrame = true;
     try {
       _triggerFlash();
@@ -737,6 +799,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
               yawDeg: captureYaw,
               pitchDeg: capturePitch,
               rollDeg: captureRoll,
+              altYawDeg: altYaw,
             );
             hasFrame = true;
           } else {
@@ -747,6 +810,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
                 yawDeg: captureYaw,
                 pitchDeg: capturePitch,
                 rollDeg: captureRoll,
+                altYawDeg: altYaw,
               );
               hasFrame = true;
             }
@@ -900,6 +964,9 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     }
     _attitude.snapTo(yaw: state.yaw, pitch: state.pitch, roll: state.roll);
     _startSensors();
+    // Zero the gyro track on the same panorama yaw the view was reset to, so
+    // every frame can carry an independent gyro-predicted yaw candidate.
+    _gyroAnchorYawDeg = state.yaw;
     showToast('开始采集 · 保持机位不动并缓慢转动');
     return true;
   }
@@ -922,6 +989,10 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     _aligningId = null;
     _lockMissAt = null;
     _guideId = null;
+    if (state.gyroEnabled || state.previewGyroEnabled) {
+      _gyro.reset();
+      _gyroAnchorYawDeg = state.yaw;
+    }
     state = state.copyWith(
       points: vrLayout
           ? createVr24Points(yawOffsetDeg: yawOffsetDeg)
