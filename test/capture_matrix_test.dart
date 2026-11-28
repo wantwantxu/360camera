@@ -22,4 +22,26 @@ void main() {
     final sample = stitcher.buffer.getPixel(128, 64);
     expect(sample.r.toInt() > 100, isTrue);
   });
+
+  test('yaw offset rotates the whole matrix and wraps at 360°', () {
+    final rotated = createStandard14Points(yawOffsetDeg: 350);
+    final mids = rotated.where((e) => e.ring == CaptureRing.mid).toList();
+    expect(mids.first.yaw, closeTo(350, 1e-9));
+    expect(mids[1].yaw, closeTo(35, 1e-9));
+    expect(mids[7].yaw, closeTo(305, 1e-9));
+
+    final uppers = rotated.where((e) => e.ring == CaptureRing.upper).toList();
+    expect(uppers.map((e) => e.pitch), everyElement(45));
+    final lowers = rotated.where((e) => e.ring == CaptureRing.lower).toList();
+    expect(lowers.map((e) => e.pitch), everyElement(-45));
+  });
+
+  test('capture point ids stay unique after rotation', () {
+    final pts = createStandard14Points(yawOffsetDeg: 17.5);
+    expect(pts.map((e) => e.id).toSet(), hasLength(pts.length));
+    expect(
+      pts.map((e) => e.yaw).every((yaw) => yaw >= 0 && yaw < 360),
+      isTrue,
+    );
+  });
 }

@@ -12,6 +12,8 @@
 	<string>PANO 360 Pro 需要将导出的全景照片保存到相册。</string>
 	<key>NSMotionUsageDescription</key>
 	<string>PANO 360 Pro 使用设备运动传感器实现陀螺仪云台对准与体感环顾。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>PANO 360 Pro 使用定位计算与巡检拍摄点位的距离，帮助您到达指定拍摄位置。</string>
 	<key>CFBundleDisplayName</key>
 	<string>PANO 360 Pro</string>
 	<key>CFBundleDevelopmentRegion</key>

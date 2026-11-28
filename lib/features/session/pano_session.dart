@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -16,12 +15,15 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/constants.dart';
 import '../../core/utils/angle_utils.dart';
+import '../../core/utils/attitude_filter.dart';
+import '../../core/utils/compass_utils.dart';
 import '../../data/gallery_repository.dart';
 import '../../domain/app_enums.dart';
 import '../../domain/capture_matrix.dart';
 import '../../domain/capture_point.dart';
 import '../../domain/export_options.dart';
 import '../../domain/pano_work.dart';
+import '../capture/camera_frame_decoder.dart';
 import '../capture/procedural_pano.dart';
 import '../capture/stitch_projector.dart';
 import '../preview/color_filters.dart';
@@ -193,11 +195,24 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   Timer? _toastTimer;
   Timer? _flashTimer;
   DateTime? _lockStart;
+  DateTime? _lockMissAt;
   String? _aligningId;
+  String? _guideId;
   double? _magYawOffset;
   AccelerometerEvent? _lastAcc;
   MagnetometerEvent? _lastMag;
+  final AttitudeFilter _attitude = AttitudeFilter();
+  DateTime? _lastAttitudeAt;
   bool _userDragging = false;
+  bool _capturingFrame = false;
+  int _cameraGeneration = 0;
+  Future<void> _cameraOps = Future<void>.value();
+
+  Future<void> _enqueueCameraOp(Future<void> Function() op) {
+    final result = _cameraOps.then((_) => op());
+    _cameraOps = result.then<void>((_) {}, onError: (_) {});
+    return result;
+  }
 
   Future<void> _init() async {
     final works = await _galleryRepo.loadAll();
@@ -217,7 +232,6 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
       previewBytes: preview,
     );
     _tick = Timer.periodic(const Duration(milliseconds: 33), (_) => _onTick());
-    await initCamera();
   }
 
   Future<bool> requestPermissions() async {
@@ -233,9 +247,15 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     return cam.isGranted;
   }
 
-  Future<void> initCamera() async {
+  Future<void> initCamera() {
+    final generation = ++_cameraGeneration;
+    return _enqueueCameraOp(() => _initCameraImpl(generation));
+  }
+
+  Future<void> _initCameraImpl(int generation) async {
     try {
       final ok = await requestPermissions();
+      if (generation != _cameraGeneration) return;
       if (!ok) {
         state = state.copyWith(
           cameraReady: false,
@@ -245,6 +265,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
         return;
       }
       final cameras = await availableCameras();
+      if (generation != _cameraGeneration) return;
       if (cameras.isEmpty) {
         state = state.copyWith(
           cameraReady: false,
@@ -257,14 +278,22 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => cameras.first,
       );
-      await cameraController?.dispose();
+      final previous = cameraController;
+      cameraController = null;
+      await previous?.dispose();
+      // 4:3 stills give the ~53°×67° portrait field of view the 45° capture
+      // grid needs; 16:9 crops would leave uncovered slivers between points.
       final controller = CameraController(
         back,
-        ResolutionPreset.high,
+        ResolutionPreset.max,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await controller.initialize();
+      if (generation != _cameraGeneration) {
+        await controller.dispose();
+        return;
+      }
       cameraController = controller;
       state = state.copyWith(
         cameraReady: true,
@@ -272,6 +301,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
         source: CaptureSource.camera,
       );
     } catch (e) {
+      if (generation != _cameraGeneration) return;
       state = state.copyWith(
         cameraReady: false,
         cameraError: '相机初始化失败: $e',
@@ -280,10 +310,48 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     }
   }
 
+  /// Stops sensors and releases the camera when leaving a capture screen.
+  Future<void> releaseCamera() async {
+    _cameraGeneration++;
+    _stopSensors();
+    _magYawOffset = null;
+    _lastAcc = null;
+    _lastMag = null;
+    _userDragging = false;
+    _attitude.clear();
+    _lastAttitudeAt = null;
+    _guideId = null;
+    _lockMissAt = null;
+    final controller = cameraController;
+    cameraController = null;
+    if (mounted) {
+      state = state.copyWith(
+        cameraReady: false,
+        cameraError: null,
+        gyroEnabled: false,
+        lockedTargetId: null,
+        lockProgress: 0,
+      );
+    }
+    await _enqueueCameraOp(() async {
+      try {
+        await controller?.dispose();
+      } catch (_) {
+        // The OS may already have released the camera.
+      }
+    });
+  }
+
   void setMode(AppMode mode) {
-    state = state.copyWith(mode: mode);
     if (mode == AppMode.preview) {
-      state = state.copyWith(autoRotate: false);
+      state = state.copyWith(
+        mode: mode,
+        autoRotate: false,
+        gyroEnabled: false,
+      );
+      if (!state.previewGyroEnabled) _stopSensors();
+    } else {
+      state = state.copyWith(mode: mode);
     }
   }
 
@@ -296,7 +364,9 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
 
   void toggleGyro() {
     final next = !state.gyroEnabled;
-    state = state.copyWith(gyroEnabled: next);
+    // Without sensors the tilt is unknown; a stale angle would otherwise keep
+    // showing a level warning and block auto-lock in virtual-gimbal mode.
+    state = state.copyWith(gyroEnabled: next, roll: next ? state.roll : 0);
     if (next) {
       _startSensors();
       showToast('已启用手机陀螺仪云台');
@@ -313,17 +383,25 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
       lockedTargetId: null,
     );
     _lockStart = null;
+    _lockMissAt = null;
     _aligningId = null;
   }
 
   void _startSensors() {
     _magSub?.cancel();
     _accSub?.cancel();
-    _magSub = magnetometerEventStream().listen((e) {
+    _lastMag = null;
+    _lastAcc = null;
+    _lastAttitudeAt = null;
+    _magSub = magnetometerEventStream(
+      samplingPeriod: SensorInterval.gameInterval,
+    ).listen((e) {
       _lastMag = e;
       _updateAttitudeFromSensors();
     });
-    _accSub = accelerometerEventStream().listen((e) {
+    _accSub = accelerometerEventStream(
+      samplingPeriod: SensorInterval.gameInterval,
+    ).listen((e) {
       _lastAcc = e;
       _updateAttitudeFromSensors();
     });
@@ -334,45 +412,101 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     _accSub?.cancel();
     _magSub = null;
     _accSub = null;
+    _lastAttitudeAt = null;
+    _attitude.clear();
   }
 
+  /// Feeds raw sensors through the smoothing filter. UI state is only published
+  /// from [_publishSmoothedAttitude] on the 30 Hz timer so compass noise never
+  /// reaches the AR overlay directly.
   void _updateAttitudeFromSensors() {
     if (!state.gyroEnabled && !state.previewGyroEnabled) return;
     if (_userDragging) return;
     final acc = _lastAcc;
-    final mag = _lastMag;
     if (acc == null) return;
+    final accLen = math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+    if (accLen < 1e-3) return;
 
-    final pitch = radToDeg(math.atan2(-acc.y, math.sqrt(acc.x * acc.x + acc.z * acc.z)));
-    final roll = radToDeg(math.atan2(acc.x, acc.z));
+    final now = DateTime.now();
+    final dtMs = _lastAttitudeAt == null
+        ? 50.0
+        : now.difference(_lastAttitudeAt!).inMicroseconds / 1000.0;
+    _lastAttitudeAt = now;
 
-    double yaw = state.yaw;
-    if (mag != null) {
-      final mx = mag.x;
-      final my = mag.y;
-      final mz = mag.z;
-      // Tilt-compensated heading (approx).
-      final rollRad = degToRad(roll);
-      final pitchRad = degToRad(pitch);
-      final xh = mx * math.cos(pitchRad) + mz * math.sin(pitchRad);
-      final yh = mx * math.sin(rollRad) * math.sin(pitchRad) +
-          my * math.cos(rollRad) -
-          mz * math.sin(rollRad) * math.cos(pitchRad);
-      var heading = radToDeg(math.atan2(-yh, xh));
-      heading = normalizeDeg360(heading);
-      _magYawOffset ??= normalizeDeg360(state.yaw - heading);
-      yaw = normalizeDeg360(heading + (_magYawOffset ?? 0));
+    final mag = _lastMag;
+    final reading = mag == null
+        ? null
+        : computeCompassReading(
+            ax: acc.x,
+            ay: acc.y,
+            az: acc.z,
+            mx: mag.x,
+            my: mag.y,
+            mz: mag.z,
+          );
+
+    if (reading == null) {
+      // Keep the last yaw when the bearing is undefined (camera aimed at the
+      // ground/sky or no magnetometer); still track camera pitch and roll.
+      final ux = acc.x / accLen;
+      final uy = acc.y / accLen;
+      final uz = acc.z / accLen;
+      _attitude.update(
+        yawTarget: _attitude.yaw ?? state.yaw,
+        pitchTarget: clampPitch(radToDeg(math.asin((-uz).clamp(-1.0, 1.0)))),
+        rollTarget: radToDeg(math.atan2(-ux, uy)),
+        dtMs: dtMs,
+      );
+      return;
     }
 
-    state = state.copyWith(
-      yaw: yaw,
-      pitch: clampPitch(pitch),
-      roll: roll,
+    _magYawOffset ??= normalizeDeg360(state.yaw - reading.headingDeg);
+    _attitude.update(
+      yawTarget: normalizeDeg360(reading.headingDeg + (_magYawOffset ?? 0)),
+      pitchTarget: clampPitch(reading.cameraPitchDeg),
+      rollTarget: reading.rollDeg,
+      dtMs: dtMs,
     );
   }
 
+  void _publishSmoothedAttitude() {
+    if (!state.gyroEnabled && !state.previewGyroEnabled) return;
+    if (_userDragging) return;
+    final yaw = _attitude.yaw;
+    final pitch = _attitude.pitch;
+    final roll = _attitude.roll;
+    if (yaw == null || pitch == null || roll == null) return;
+    final dYaw = normalizeDeg180(yaw - state.yaw).abs();
+    final dPitch = (pitch - state.pitch).abs();
+    final dRoll = normalizeDeg180(roll - state.roll).abs();
+    if (dYaw < 0.08 && dPitch < 0.08 && dRoll < 0.2) return;
+    state = state.copyWith(yaw: yaw, pitch: pitch, roll: roll);
+  }
+
   void beginDrag() => _userDragging = true;
-  void endDrag() => _userDragging = false;
+
+  void endDrag() {
+    _userDragging = false;
+    if (!state.gyroEnabled && !state.previewGyroEnabled) return;
+    // Re-anchor the world offset to the dragged view so the panorama does not
+    // snap back when the finger lifts.
+    final acc = _lastAcc;
+    final mag = _lastMag;
+    if (acc != null && mag != null) {
+      final reading = computeCompassReading(
+        ax: acc.x,
+        ay: acc.y,
+        az: acc.z,
+        mx: mag.x,
+        my: mag.y,
+        mz: mag.z,
+      );
+      if (reading != null) {
+        _magYawOffset = normalizeDeg360(state.yaw - reading.headingDeg);
+      }
+    }
+    _attitude.snapTo(yaw: state.yaw, pitch: state.pitch, roll: state.roll);
+  }
 
   void nudgeAttitude({double dYaw = 0, double dPitch = 0}) {
     state = state.copyWith(
@@ -391,12 +525,15 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     stitcher.reset();
     state = state.copyWith(
       points: createStandard14Points(),
+      roll: state.gyroEnabled ? state.roll : 0,
       lockProgress: 0,
       lockedTargetId: null,
       nearestGuideText: null,
     );
     _lockStart = null;
     _aligningId = null;
+    _guideId = null;
+    _lockMissAt = null;
     showToast('已重置全部点位');
   }
 
@@ -414,65 +551,141 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     return best;
   }
 
+  /// Nearest uncaptured point with hysteresis: the current guide target is kept
+  /// until another point is clearly closer, so arrows and auto-lock do not
+  /// flicker between neighbours on the staggered VR rings.
+  CapturePoint? _selectStickyTarget() {
+    final nearest = findNearestUncaptured();
+    if (nearest == null) {
+      _guideId = null;
+      return null;
+    }
+    final stickyId = _guideId;
+    if (stickyId != null && stickyId != nearest.id) {
+      for (final p in state.points) {
+        if (p.id != stickyId || p.captured) continue;
+        final nearestAng = sphericalAngleDeg(
+          state.yaw,
+          state.pitch,
+          nearest.yaw,
+          nearest.pitch,
+        );
+        final stickyAng = sphericalAngleDeg(
+          state.yaw,
+          state.pitch,
+          p.yaw,
+          p.pitch,
+        );
+        if (stickyAng <= nearestAng + PanoConstants.autoLockExitMarginDeg) {
+          return p;
+        }
+        break;
+      }
+    }
+    _guideId = nearest.id;
+    return nearest;
+  }
+
+  void _setLockUi(String? id, double progress) {
+    if (state.lockedTargetId == id && state.lockProgress == progress) return;
+    state = state.copyWith(lockedTargetId: id, lockProgress: progress);
+  }
+
+  void _clearLock() {
+    _aligningId = null;
+    _lockStart = null;
+    _lockMissAt = null;
+    _setLockUi(null, 0);
+  }
+
   void _onTick() {
-    if (state.mode == AppMode.preview && state.autoRotate && !_userDragging) {
+    if (state.mode == AppMode.preview &&
+        state.autoRotate &&
+        !state.previewGyroEnabled &&
+        !_userDragging) {
       state = state.copyWith(yaw: normalizeDeg360(state.yaw + 0.35));
     }
 
+    _publishSmoothedAttitude();
+
     if (state.mode != AppMode.capture) return;
 
-    final nearest = findNearestUncaptured();
+    final target = _selectStickyTarget();
+
+    if (_capturingFrame) {
+      // Keep the lock ring full while the still is being written: the photo is
+      // taken asynchronously, so clearing the cue immediately made users start
+      // turning again mid-exposure and every frame picked up a few degrees of
+      // smear. The next tick after capture releases the cue.
+      return;
+    }
+
     String? guide;
-    if (nearest != null) {
-      final ang = sphericalAngleDeg(state.yaw, state.pitch, nearest.yaw, nearest.pitch);
+    var ang = double.infinity;
+    if (target != null) {
+      ang = sphericalAngleDeg(state.yaw, state.pitch, target.yaw, target.pitch);
       if (ang > PanoConstants.alignThresholdDeg) {
-        final dy = normalizeDeg180(nearest.yaw - state.yaw);
-        final dp = nearest.pitch - state.pitch;
+        final dy = normalizeDeg180(target.yaw - state.yaw);
+        final dp = target.pitch - state.pitch;
         final dir = dy.abs() > dp.abs()
             ? (dy > 0 ? '向右' : '向左')
             : (dp > 0 ? '向上' : '向下');
-        guide = '$dir ${ang.toStringAsFixed(0)}° 寻找 ${nearest.id}';
+        guide = '$dir ${ang.toStringAsFixed(0)}° 寻找 ${target.id}';
       }
     }
     if (guide != state.nearestGuideText) {
       state = state.copyWith(nearestGuideText: guide);
     }
 
-    if (!state.autoLockEnabled || nearest == null) {
-      if (state.lockProgress != 0 || state.lockedTargetId != null) {
-        state = state.copyWith(lockProgress: 0, lockedTargetId: null);
+    if (!state.autoLockEnabled || target == null) {
+      _clearLock();
+      return;
+    }
+
+    final gyroActive = state.gyroEnabled || state.previewGyroEnabled;
+    final stable = !gyroActive ||
+        _attitude.rateDps <= PanoConstants.autoLockStableRateDps;
+    final levelOk = state.roll.abs() <= PanoConstants.rollWarnDeg;
+
+    if (_aligningId != target.id) {
+      _aligningId = null;
+      _lockStart = null;
+      _lockMissAt = null;
+      if (ang <= PanoConstants.alignThresholdDeg && levelOk && stable) {
+        _aligningId = target.id;
+        _lockStart = DateTime.now();
+        _setLockUi(target.id, 0);
+      } else {
+        _setLockUi(null, 0);
       }
       return;
     }
 
-    final ang = sphericalAngleDeg(state.yaw, state.pitch, nearest.yaw, nearest.pitch);
-    final levelOk = state.roll.abs() <= PanoConstants.rollWarnDeg;
-    if (ang <= PanoConstants.alignThresholdDeg && levelOk) {
-      if (_aligningId != nearest.id) {
-        _aligningId = nearest.id;
-        _lockStart = DateTime.now();
-        state = state.copyWith(lockedTargetId: nearest.id, lockProgress: 0);
-      } else {
-        final elapsed =
-            DateTime.now().difference(_lockStart ?? DateTime.now()).inMilliseconds;
-        final progress = (elapsed / PanoConstants.autoLockHoldMs).clamp(0.0, 1.0);
-        state = state.copyWith(
-          lockedTargetId: nearest.id,
-          lockProgress: progress,
-        );
-        if (progress >= 1) {
-          unawaited(capturePoint(nearest));
-          _aligningId = null;
-          _lockStart = null;
-          state = state.copyWith(lockProgress: 0, lockedTargetId: null);
-        }
+    final withinHold = ang <=
+        PanoConstants.alignThresholdDeg + PanoConstants.autoLockExitMarginDeg;
+    if (!withinHold || !levelOk || !stable) {
+      // Brief sensor glitches or a small hand tremor should not discard the
+      // hold; only give up after the miss tolerance elapses.
+      final now = DateTime.now();
+      _lockMissAt ??= now;
+      if (now.difference(_lockMissAt!).inMilliseconds >=
+          PanoConstants.autoLockMissToleranceMs) {
+        _clearLock();
       }
-    } else {
+      return;
+    }
+    _lockMissAt = null;
+    _lockStart ??= DateTime.now();
+    final elapsed = DateTime.now().difference(_lockStart!).inMilliseconds;
+    final progress = (elapsed / PanoConstants.autoLockHoldMs).clamp(0.0, 1.0);
+    _setLockUi(target.id, progress);
+    if (progress >= 1) {
       _aligningId = null;
       _lockStart = null;
-      if (state.lockProgress != 0 || state.lockedTargetId != null) {
-        state = state.copyWith(lockProgress: 0, lockedTargetId: null);
-      }
+      _lockMissAt = null;
+      // Leave the ring at 100% ("已锁定 · 保持稳定") until capturePoint
+      // finishes; see the _capturingFrame branch above.
+      unawaited(capturePoint(target));
     }
   }
 
@@ -481,7 +694,7 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
       setMode(AppMode.capture);
       return;
     }
-    final nearest = findNearestUncaptured();
+    final nearest = _selectStickyTarget();
     if (nearest == null) {
       showToast('全部点位已捕捉，可点击合成预览');
       return;
@@ -495,58 +708,97 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   }
 
   Future<void> capturePoint(CapturePoint point) async {
-    if (point.captured) return;
-    _triggerFlash();
-
-    img.Image? frame;
+    if (point.captured || _capturingFrame) return;
+    // Snapshot the actual pointing direction at shutter time; the point may be
+    // up to the lock tolerance away, and projecting at the point's nominal
+    // angle would shift every patch and produce visible seams.
+    final captureYaw = state.yaw;
+    final capturePitch = state.pitch;
+    final captureRoll = state.roll;
+    _capturingFrame = true;
     try {
-      if (state.source == CaptureSource.camera &&
-          (cameraController?.value.isInitialized ?? false)) {
-        final file = await cameraController!.takePicture();
-        final bytes = await File(file.path).readAsBytes();
-        frame = img.decodeImage(bytes);
-        try {
-          await File(file.path).delete();
-        } catch (_) {}
-      } else {
-        final preset = state.source == CaptureSource.camera
-            ? CaptureSource.sunset
-            : state.source;
-        final full = generateProceduralEquirectangular(preset, width: 1024, height: 512);
-        // Crop a FOV-like patch around current attitude for demo sources.
-        final cx = (normalizeDeg360(point.yaw) / 360 * full.width).round();
-        final cy = ((90 - point.pitch) / 180 * full.height).round();
-        final pw = full.width ~/ 5;
-        final ph = full.height ~/ 3;
-        frame = img.copyCrop(
-          full,
-          x: (cx - pw ~/ 2).clamp(0, full.width - pw),
-          y: (cy - ph ~/ 2).clamp(0, full.height - ph),
-          width: pw,
-          height: ph,
-        );
+      _triggerFlash();
+
+      var hasFrame = false;
+      try {
+        if (state.source == CaptureSource.camera &&
+            (cameraController?.value.isInitialized ?? false)) {
+          final file = await cameraController!.takePicture();
+          final bytes = await File(file.path).readAsBytes();
+          try {
+            await File(file.path).delete();
+          } catch (_) {}
+          final decoded = await decodeCameraFrame(bytes);
+          if (decoded != null) {
+            stitcher.projectRgba(
+              rgba: decoded.rgba,
+              imageWidth: decoded.width,
+              imageHeight: decoded.height,
+              yawDeg: captureYaw,
+              pitchDeg: capturePitch,
+              rollDeg: captureRoll,
+            );
+            hasFrame = true;
+          } else {
+            final frame = img.decodeImage(bytes);
+            if (frame != null) {
+              stitcher.projectFrame(
+                frame,
+                yawDeg: captureYaw,
+                pitchDeg: capturePitch,
+                rollDeg: captureRoll,
+              );
+              hasFrame = true;
+            }
+          }
+        } else {
+          final preset = state.source == CaptureSource.camera
+              ? CaptureSource.sunset
+              : state.source;
+          final full = generateProceduralEquirectangular(preset, width: 1024, height: 512);
+          // Crop a FOV-like patch around current attitude for demo sources.
+          final cx = (normalizeDeg360(point.yaw) / 360 * full.width).round();
+          final cy = ((90 - point.pitch) / 180 * full.height).round();
+          final pw = full.width ~/ 5;
+          final ph = full.height ~/ 3;
+          final frame = img.copyCrop(
+            full,
+            x: (cx - pw ~/ 2).clamp(0, full.width - pw),
+            y: (cy - ph ~/ 2).clamp(0, full.height - ph),
+            width: pw,
+            height: ph,
+          );
+          stitcher.projectFrame(
+            frame,
+            yawDeg: point.yaw,
+            pitchDeg: point.pitch,
+            rollDeg: captureRoll,
+          );
+          hasFrame = true;
+        }
+      } catch (e) {
+        showToast('捕捉失败: $e');
+        return;
       }
-    } catch (e) {
-      showToast('捕捉失败: $e');
-      return;
+
+      if (!hasFrame) {
+        showToast('无法解码图像帧');
+        return;
+      }
+
+      final updated = state.points
+          .map((e) => e.id == point.id ? e.copyWith(captured: true) : e)
+          .toList();
+      state = state.copyWith(points: updated);
+      final done = updated.every((e) => e.captured);
+      showToast(
+        done
+            ? '已捕捉全部 ${updated.length} 个方向，可以完成拍摄'
+            : '已捕捉 ${point.id}（${state.capturedCount}/${updated.length}）',
+      );
+    } finally {
+      _capturingFrame = false;
     }
-
-    if (frame == null) {
-      showToast('无法解码图像帧');
-      return;
-    }
-
-    stitcher.projectFrame(
-      frame,
-      yawDeg: point.yaw,
-      pitchDeg: point.pitch,
-    );
-
-    final updated = state.points
-        .map((e) => e.id == point.id ? e.copyWith(captured: true) : e)
-        .toList();
-    state = state.copyWith(points: updated);
-    showToast('已捕捉 ${point.id}（${state.capturedCount}/14）');
   }
 
   Future<void> instantFullStitch() async {
@@ -561,32 +813,148 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     await completeStitching(titlePrefix: '${preset.label} · 一键全景');
   }
 
-  Future<void> completeStitching({String? titlePrefix}) async {
+  Future<PanoWork?> completeStitching({String? titlePrefix}) async {
     if (state.capturedCount == 0 && titlePrefix == null) {
       showToast('请先捕捉至少一个点位');
-      return;
+      return null;
     }
+    if (state.isStitching) return null;
     state = state.copyWith(isStitching: true);
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      // 4K JPEG encoding blocks for seconds; keep the UI responsive by
+      // encoding from a snapshot on a background isolate.
+      final bytes = await compute(
+        _encodeEquirectJpeg,
+        (stitcher.snapshotRgba(), stitcher.width, stitcher.height, 92),
+      );
+      final work = await _persistWork(
+        bytes: bytes,
+        title: titlePrefix ??
+            '${state.points.length}点实景全景 (${DateTime.now().toString().substring(11, 16)})',
+        source: state.source.name,
+        width: stitcher.width,
+        height: stitcher.height,
+      );
+      state = state.copyWith(
+        isStitching: false,
+        mode: AppMode.preview,
+        gyroEnabled: false,
+        previewBytes: bytes,
+        activeWorkId: work.id,
+        gallery: [work, ...state.gallery.where((e) => e.id != work.id)],
+      );
+      if (!state.previewGyroEnabled) _stopSensors();
+      showToast('全景合成完成！拖动查看拼接效果');
+      return work;
+    } catch (e) {
+      state = state.copyWith(isStitching: false);
+      showToast('全景合成失败：$e');
+      return null;
+    }
+  }
 
-    final bytes = stitcher.encodeJpeg(quality: 90);
-    final work = await _persistWork(
-      bytes: bytes,
-      title: titlePrefix ??
-          '14点实景全景 (${DateTime.now().toString().substring(11, 16)})',
-      source: state.source.name,
-      width: stitcher.width,
-      height: stitcher.height,
-    );
-
+  /// 以当前视角作为 H-01 的起始方向，重置并进入巡检拍摄。
+  void startInspectionCapture({double yawOffsetDeg = 0}) {
+    _resetCaptureMatrix(yawOffsetDeg: yawOffsetDeg);
     state = state.copyWith(
-      isStitching: false,
-      mode: AppMode.preview,
-      previewBytes: bytes,
-      activeWorkId: work.id,
-      gallery: [work, ...state.gallery.where((e) => e.id != work.id)],
+      mode: AppMode.capture,
+      roll: state.gyroEnabled ? state.roll : 0,
     );
-    showToast('全景合成完成！支持拖拽环顾与小行星视角');
+  }
+
+  /// 手机拍 VR：以当前视角为起点启动 8×3 共 24 个方向的采集。
+  ///
+  /// When [compassHeadingDeg] is supplied the panorama longitude 0° is anchored
+  /// to that measured world heading, and the view is reset to [yawOffsetDeg],
+  /// so H-01 matches the direction the phone was facing when capture started.
+  bool startVrCapture({
+    double yawOffsetDeg = 0,
+    double? compassHeadingDeg,
+  }) {
+    if (state.source != CaptureSource.camera ||
+        !state.cameraReady ||
+        !(cameraController?.value.isInitialized ?? false)) {
+      showToast('需要可用的后置相机才能开始空间采集');
+      return false;
+    }
+    _resetCaptureMatrix(yawOffsetDeg: yawOffsetDeg, vrLayout: true);
+    if (compassHeadingDeg != null && compassHeadingDeg.isFinite) {
+      _magYawOffset = normalizeDeg360(yawOffsetDeg - compassHeadingDeg);
+      state = state.copyWith(
+        mode: AppMode.capture,
+        gyroEnabled: true,
+        yaw: normalizeDeg360(yawOffsetDeg),
+        pitch: 0,
+        roll: 0,
+        points: state.points,
+      );
+    } else {
+      state = state.copyWith(
+        mode: AppMode.capture,
+        gyroEnabled: true,
+        pitch: 0,
+        roll: 0,
+        points: state.points,
+      );
+    }
+    _attitude.snapTo(yaw: state.yaw, pitch: state.pitch, roll: state.roll);
+    _startSensors();
+    showToast('开始采集 · 保持机位不动并缓慢转动');
+    return true;
+  }
+
+  /// 完成一个巡检点位后静默重置矩阵，供下一个点位使用。
+  void prepareNextInspectionPoint() {
+    _resetCaptureMatrix();
+    state = state.copyWith(
+      mode: AppMode.capture,
+      roll: state.gyroEnabled ? state.roll : 0,
+    );
+  }
+
+  void _resetCaptureMatrix({
+    double yawOffsetDeg = 0,
+    bool vrLayout = false,
+  }) {
+    stitcher.reset();
+    _lockStart = null;
+    _aligningId = null;
+    _lockMissAt = null;
+    _guideId = null;
+    state = state.copyWith(
+      points: vrLayout
+          ? createVr24Points(yawOffsetDeg: yawOffsetDeg)
+          : createStandard14Points(yawOffsetDeg: yawOffsetDeg),
+      lockProgress: 0,
+      lockedTargetId: null,
+      nearestGuideText: null,
+    );
+  }
+
+  Future<void> discardWork(String id) async {
+    await _galleryRepo.delete(id);
+    final remaining = state.gallery.where((e) => e.id != id).toList();
+    var activeId = state.activeWorkId;
+    var preview = state.previewBytes;
+    if (activeId == id) {
+      if (remaining.isEmpty) {
+        activeId = null;
+        preview = null;
+      } else {
+        activeId = remaining.first.id;
+        try {
+          preview = await File(remaining.first.imagePath).readAsBytes();
+        } catch (_) {
+          preview = null;
+        }
+      }
+    }
+    state = state.copyWith(
+      gallery: remaining,
+      activeWorkId: activeId,
+      previewBytes: preview,
+    );
   }
 
   Future<PanoWork> _persistWork({
@@ -603,13 +971,9 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     final thumbPath = p.join(thumbsDir, '$id.jpg');
     await File(imagePath).writeAsBytes(bytes);
 
-    final decoded = img.decodeImage(bytes);
-    if (decoded != null) {
-      final thumb = img.copyResize(decoded, width: 320);
-      await File(thumbPath).writeAsBytes(img.encodeJpg(thumb, quality: 80));
-    } else {
-      await File(thumbPath).writeAsBytes(bytes);
-    }
+    // Decoding a 4K JPEG in pure Dart stalls the UI; offload the thumbnail.
+    final thumb = await compute(_encodeThumbJpeg, (bytes, 320, 80));
+    await File(thumbPath).writeAsBytes(thumb.isEmpty ? bytes : thumb);
 
     final work = PanoWork(
       id: id,
@@ -856,12 +1220,32 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
   void clearToast() => state = state.copyWith(toast: null);
 
   void slewToNearest() {
-    final n = findNearestUncaptured();
+    final n = _selectStickyTarget();
     if (n == null) {
       showToast('没有未捕捉点位');
       return;
     }
-    state = state.copyWith(yaw: n.yaw, pitch: n.pitch);
+    final yaw = normalizeDeg360(n.yaw);
+    final pitch = clampPitch(n.pitch);
+    state = state.copyWith(yaw: yaw, pitch: pitch);
+    if (state.gyroEnabled || state.previewGyroEnabled) {
+      final acc = _lastAcc;
+      final mag = _lastMag;
+      if (acc != null && mag != null) {
+        final reading = computeCompassReading(
+          ax: acc.x,
+          ay: acc.y,
+          az: acc.z,
+          mx: mag.x,
+          my: mag.y,
+          mz: mag.z,
+        );
+        if (reading != null) {
+          _magYawOffset = normalizeDeg360(yaw - reading.headingDeg);
+          _attitude.snapTo(yaw: yaw, pitch: pitch, roll: state.roll);
+        }
+      }
+    }
     showToast('已转向 ${n.id}');
   }
 
@@ -874,4 +1258,67 @@ class PanoSessionNotifier extends StateNotifier<PanoSessionState> {
     cameraController?.dispose();
     super.dispose();
   }
+}
+
+Uint8List _encodeEquirectJpeg((Uint8List, int, int, int) args) {
+  final (rgba, width, height, quality) = args;
+  final sharpened = _unsharpRgba(rgba, width, height);
+  final image = img.Image.fromBytes(
+    width: width,
+    height: height,
+    bytes: sharpened.buffer,
+    numChannels: 4,
+    order: img.ChannelOrder.rgba,
+  );
+  return img.encodeJpg(image, quality: quality);
+}
+
+/// Mild unsharp mask to restore the modulation lost to bilinear resampling
+/// and JPEG-90 compression without introducing visible halos at 4K.
+Uint8List _unsharpRgba(
+  Uint8List rgba,
+  int width,
+  int height, {
+  double amount = 0.35,
+}) {
+  final blur = Uint8List(width * height * 3);
+  for (var y = 0; y < height; y++) {
+    final row = y * width;
+    for (var x = 0; x < width; x++) {
+      final i = (row + x) * 4;
+      final l = x > 0 ? i - 4 : i;
+      final r = x < width - 1 ? i + 4 : i;
+      final o = (row + x) * 3;
+      for (var c = 0; c < 3; c++) {
+        blur[o + c] = (rgba[l + c] + 2 * rgba[i + c] + rgba[r + c]) >> 2;
+      }
+    }
+  }
+  final out = Uint8List.fromList(rgba);
+  for (var y = 0; y < height; y++) {
+    final up = y > 0 ? y - 1 : y;
+    final down = y < height - 1 ? y + 1 : y;
+    for (var x = 0; x < width; x++) {
+      final o = (y * width + x) * 3;
+      final ou = (up * width + x) * 3;
+      final od = (down * width + x) * 3;
+      final i = (y * width + x) * 4;
+      for (var c = 0; c < 3; c++) {
+        final b = (blur[ou + c] + 2 * blur[o + c] + blur[od + c]) >> 2;
+        final v = rgba[i + c];
+        out[i + c] = (v + (v - b) * amount).round().clamp(0, 255);
+      }
+    }
+  }
+  return out;
+}
+
+Uint8List _encodeThumbJpeg((Uint8List, int, int) args) {
+  final (bytes, width, quality) = args;
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) return Uint8List(0);
+  return img.encodeJpg(
+    img.copyResize(decoded, width: width),
+    quality: quality,
+  );
 }

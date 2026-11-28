@@ -1,6 +1,5 @@
 import 'dart:io';
 
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -8,9 +7,19 @@ import '../../core/constants.dart';
 import '../../core/theme/pano_colors.dart';
 import '../../core/utils/angle_utils.dart';
 import '../../domain/app_enums.dart';
+import '../capture/widgets/camera_preview_cover.dart';
 import '../capture/widgets/capture_hud.dart';
 import '../export/export_sheet.dart';
 import '../gallery/gallery_sheet.dart';
+import '../inspection/inspection_controller.dart';
+import '../inspection/inspection_state.dart';
+import '../inspection/widgets/guidance_dock.dart';
+import '../inspection/widgets/guidance_hud.dart';
+import '../inspection/widgets/inspection_capture_banner.dart';
+import '../inspection/widgets/inspection_task_sheet.dart';
+import '../inspection/widgets/reference_overlay.dart';
+import '../inspection/widgets/review_dock.dart';
+import '../inspection/widgets/waypoint_brief_sheet.dart';
 import '../preview/color_filters.dart';
 import '../preview/pano_sphere_view.dart';
 import '../session/pano_session.dart';
@@ -22,16 +31,56 @@ class HomePage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(panoSessionProvider);
+    final inspection = ref.watch(inspectionProvider);
     final notifier = ref.read(panoSessionProvider.notifier);
+    final point = inspection.activePoint;
+    final showGuidance = state.mode == AppMode.capture &&
+        inspection.stage.isGuidance &&
+        point != null;
+    final showReference = showGuidance &&
+        inspection.referenceVisible &&
+        point.referenceImagePath != null;
+
+    ref.listen<PanoSessionState>(panoSessionProvider, (previous, next) {
+      if (previous == null || !previous.isStitching || next.isStitching) return;
+      if (next.mode != AppMode.preview || next.activeWorkId == null) return;
+      final current = ref.read(inspectionProvider);
+      if (current.stage != InspectionStage.panorama) return;
+      ref
+          .read(inspectionProvider.notifier)
+          .onPanoramaStitched(next.activeWorkId);
+    });
 
     return Scaffold(
       body: Stack(
         fit: StackFit.expand,
         children: [
           _Viewport(state: state, notifier: notifier),
-          if (state.mode == AppMode.capture) _CaptureOverlays(state: state, notifier: notifier),
-          if (state.mode == AppMode.preview) _PreviewOverlays(state: state, notifier: notifier),
+          if (state.mode == AppMode.capture)
+            if (showGuidance)
+              if (showReference)
+                ReferenceCompareOverlay(
+                  point: point,
+                  mode: inspection.referenceMode,
+                  opacity: inspection.referenceOpacity,
+                )
+              else
+                WaypointGuidanceOverlay(
+                  inspection: inspection,
+                  onOpenDetails: () => openWaypointBriefSheet(context, ref),
+                  onExit: () => _exitGuidance(context, ref),
+                )
+            else
+              _CaptureOverlays(
+                state: state,
+                notifier: notifier,
+                inspection: inspection,
+              ),
+          if (state.mode == AppMode.preview &&
+              inspection.stage != InspectionStage.review)
+            _PreviewOverlays(state: state, notifier: notifier),
           _TopHeader(state: state, notifier: notifier),
+          const InspectionCompletionCard(),
           _BottomDock(state: state, notifier: notifier),
           if (state.flash)
             const IgnorePointer(
@@ -42,6 +91,35 @@ class HomePage extends ConsumerWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _exitGuidance(BuildContext context, WidgetRef ref) async {
+    final inspection = ref.read(inspectionProvider);
+    final point = inspection.activePoint;
+    if (point == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: PanoColors.bgCard,
+        title: const Text('退出当前点位'),
+        content: Text(
+          '退出 ${point.code} ${point.name} 的拍摄引导？已保存的全景作品与历史记录不会删除。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('继续引导'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('退出', style: TextStyle(color: PanoColors.rose)),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      ref.read(inspectionProvider.notifier).exitPoint();
+    }
   }
 }
 
@@ -70,7 +148,7 @@ class _Viewport extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            CameraPreview(notifier.cameraController!),
+            CameraPreviewCover(notifier.cameraController!),
             // Dim edges for HUD readability
             const DecoratedBox(
               decoration: BoxDecoration(
@@ -145,6 +223,14 @@ class _TopHeader extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final inspection = ref.watch(inspectionProvider);
+    final task = inspection.activeTask;
+    final width = MediaQuery.sizeOf(context).width;
+    final showBrand = width >= 600;
+    final showTelemetry = width >= 520;
+    final inspectionActive = inspection.stage != InspectionStage.idle ||
+        inspection.activePoint != null;
+
     return Positioned(
       top: 0,
       left: 0,
@@ -155,40 +241,42 @@ class _TopHeader extends ConsumerWidget {
           padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
           child: Row(
             children: [
-              GlassPill(
-                child: Row(
-                  children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(
-                        color: PanoColors.amber,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: PanoColors.amber.withValues(alpha: 0.8),
-                            blurRadius: 8,
-                          ),
-                        ],
+              if (showBrand) ...[
+                GlassPill(
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: PanoColors.amber,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: PanoColors.amber.withValues(alpha: 0.8),
+                              blurRadius: 8,
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 7),
-                    const Text(
-                      PanoConstants.brandName,
-                      style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 0.6),
-                    ),
-                    const Text(
-                      ' ${PanoConstants.brandAccent}',
-                      style: TextStyle(
-                        color: PanoColors.amber,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 0.6,
+                      const SizedBox(width: 7),
+                      const Text(
+                        PanoConstants.brandName,
+                        style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 0.6),
                       ),
-                    ),
-                  ],
+                      const Text(
+                        ' ${PanoConstants.brandAccent}',
+                        style: TextStyle(
+                          color: PanoColors.amber,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(width: 8),
+                const SizedBox(width: 8),
+              ],
               GlassPill(
                 padding: const EdgeInsets.all(3),
                 child: Row(
@@ -207,21 +295,63 @@ class _TopHeader extends ConsumerWidget {
                 ),
               ),
               const Spacer(),
-              Flexible(
-                child: GlassPill(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    child: Row(
-                      children: [
-                        _telem('Y', formatYawDeg(state.yaw), PanoColors.amber),
-                        _sep(),
-                        _telem('P', formatSignedDeg(state.pitch), PanoColors.cyan),
-                        _sep(),
-                        _telem('R', formatSignedDeg(state.roll), PanoColors.emerald),
-                      ],
+              if (showTelemetry) ...[
+                Flexible(
+                  child: GlassPill(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Row(
+                        children: [
+                          _telem('Y', formatYawDeg(state.yaw), PanoColors.amber),
+                          _sep(),
+                          _telem('P', formatSignedDeg(state.pitch), PanoColors.cyan),
+                          _sep(),
+                          _telem('R', formatSignedDeg(state.roll), PanoColors.emerald),
+                        ],
+                      ),
                     ),
                   ),
+                ),
+                const SizedBox(width: 6),
+              ],
+              GlassPill(
+                onTap: () => openInspectionTaskSheet(context, ref),
+                color: inspectionActive ? PanoColors.amberDim : null,
+                borderColor: inspectionActive
+                    ? PanoColors.amber.withValues(alpha: 0.5)
+                    : null,
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.fact_check_outlined,
+                      size: 15,
+                      color: inspectionActive ? PanoColors.amber : PanoColors.textSecondary,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '巡检',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: inspectionActive
+                            ? PanoColors.amber
+                            : PanoColors.textSecondary,
+                      ),
+                    ),
+                    if (width >= 400 && task != null)
+                      Text(
+                        ' ${task.completedCount}/${task.points.length}',
+                        style: TextStyle(
+                          fontSize: 9,
+                          fontFamily: 'monospace',
+                          color: inspectionActive
+                              ? PanoColors.amber
+                              : PanoColors.textMuted,
+                        ),
+                      ),
+                  ],
                 ),
               ),
               const SizedBox(width: 6),
@@ -309,13 +439,19 @@ class _ModeTab extends StatelessWidget {
 }
 
 class _CaptureOverlays extends StatelessWidget {
-  const _CaptureOverlays({required this.state, required this.notifier});
+  const _CaptureOverlays({
+    required this.state,
+    required this.notifier,
+    required this.inspection,
+  });
   final PanoSessionState state;
   final PanoSessionNotifier notifier;
+  final InspectionState inspection;
 
   @override
   Widget build(BuildContext context) {
     final rollWarn = state.roll.abs() > PanoConstants.rollWarnDeg;
+    final inspectionCapture = inspection.stage == InspectionStage.panorama;
     final status = rollWarn
         ? '请保持水平'
         : state.lockedTargetId != null
@@ -330,6 +466,10 @@ class _CaptureOverlays extends StatelessWidget {
           right: 12,
           child: Column(
             children: [
+              if (inspectionCapture) ...[
+                const InspectionCaptureBanner(),
+                const SizedBox(height: 8),
+              ],
               CaptureProgressCard(
                 upper: state.upperCount,
                 mid: state.midCount,
@@ -436,39 +576,63 @@ class _CaptureOverlays extends StatelessWidget {
           left: 12,
           right: 12,
           bottom: 118,
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                for (final src in CaptureSource.values)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: GlassPill(
-                      onTap: () => notifier.setSource(src),
-                      color: state.source == src ? PanoColors.amberDim : PanoColors.bgPill,
-                      borderColor: state.source == src ? PanoColors.amber : PanoColors.borderSubtle,
-                      child: Text(
-                        src.label,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: state.source == src ? PanoColors.amber : PanoColors.textSecondary,
-                        ),
+          child: inspectionCapture
+              ? Center(
+                  child: GlassPill(
+                    color: const Color(0xCC09090B),
+                    borderColor: PanoColors.amber.withValues(alpha: 0.4),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    child: Text(
+                      '巡检拍摄中 · ${state.capturedCount}/14，演示源已禁用',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: PanoColors.amber,
                       ),
                     ),
                   ),
-                GlassPill(
-                  onTap: () => notifier.instantFullStitch(),
-                  color: PanoColors.cyanDim,
-                  borderColor: PanoColors.cyan.withValues(alpha: 0.4),
-                  child: const Text(
-                    '一键完成全部点位',
-                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: PanoColors.cyan),
+                )
+              : SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      for (final src in CaptureSource.values)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: GlassPill(
+                            onTap: () => notifier.setSource(src),
+                            color: state.source == src ? PanoColors.amberDim : PanoColors.bgPill,
+                            borderColor: state.source == src
+                                ? PanoColors.amber
+                                : PanoColors.borderSubtle,
+                            child: Text(
+                              src.label,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: state.source == src
+                                    ? PanoColors.amber
+                                    : PanoColors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                      GlassPill(
+                        onTap: () => notifier.instantFullStitch(),
+                        color: PanoColors.cyanDim,
+                        borderColor: PanoColors.cyan.withValues(alpha: 0.4),
+                        child: const Text(
+                          '一键完成全部点位',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: PanoColors.cyan,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
-            ),
-          ),
         ),
       ],
     );
@@ -591,7 +755,22 @@ class _BottomDock extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final inspection = ref.watch(inspectionProvider);
+    if (inspection.stage == InspectionStage.review) {
+      return const PanoramaReviewDock();
+    }
+    if (state.mode == AppMode.capture &&
+        inspection.stage.isGuidance &&
+        inspection.hasActivePoint &&
+        !inspection.referenceVisible) {
+      return const GuidanceDock();
+    }
+
     final thumb = state.gallery.isNotEmpty ? state.gallery.first.thumbPath : null;
+    final inspectionCapture = inspection.stage == InspectionStage.panorama;
+    final rightLabel = state.mode == AppMode.capture
+        ? (inspectionCapture ? '完成拍摄' : '合成预览')
+        : '导出分享';
 
     return Positioned(
       left: 0,
@@ -681,32 +860,41 @@ class _BottomDock extends ConsumerWidget {
               ),
               const Spacer(),
               GestureDetector(
-                onTap: () {
-                  if (state.mode == AppMode.capture) {
-                    notifier.completeStitching();
-                  } else {
-                    openExportSheet(context, ref);
-                  }
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  decoration: BoxDecoration(
-                    color: PanoColors.amber,
-                    borderRadius: BorderRadius.circular(14),
-                    boxShadow: [
-                      BoxShadow(
-                        color: PanoColors.amber.withValues(alpha: 0.35),
-                        blurRadius: 14,
-                        offset: const Offset(0, 4),
+                onTap: state.isStitching
+                    ? null
+                    : () {
+                        if (state.mode == AppMode.capture) {
+                          if (inspectionCapture) {
+                            _finishInspection(context, ref);
+                          } else {
+                            notifier.completeStitching();
+                          }
+                        } else {
+                          openExportSheet(context, ref);
+                        }
+                      },
+                child: Opacity(
+                  opacity: state.isStitching ? 0.5 : 1,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: PanoColors.amber,
+                      borderRadius: BorderRadius.circular(14),
+                      boxShadow: [
+                        BoxShadow(
+                          color: PanoColors.amber.withValues(alpha: 0.35),
+                          blurRadius: 14,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Text(
+                      rightLabel,
+                      style: const TextStyle(
+                        color: PanoColors.bgBase,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 13,
                       ),
-                    ],
-                  ),
-                  child: Text(
-                    state.mode == AppMode.capture ? '合成预览' : '导出分享',
-                    style: const TextStyle(
-                      color: PanoColors.bgBase,
-                      fontWeight: FontWeight.w800,
-                      fontSize: 13,
                     ),
                   ),
                 ),
@@ -716,6 +904,41 @@ class _BottomDock extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  Future<void> _finishInspection(BuildContext context, WidgetRef ref) async {
+    final pano = ref.read(panoSessionProvider);
+    if (pano.capturedCount == 0) {
+      ref.read(panoSessionProvider.notifier).showToast('请先捕捉至少一个点位');
+      return;
+    }
+    if (pano.capturedCount < PanoConstants.maxCapturePoints) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: PanoColors.bgCard,
+          title: const Text('完成当前点位拍摄'),
+          content: Text(
+            '已捕捉 ${pano.capturedCount}/14 个方向，未覆盖全部方向可能造成全景缺失。\n\n是否仍要合成本次全景？',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('继续拍摄'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text(
+                '仍要合成',
+                style: TextStyle(color: PanoColors.amber),
+              ),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !context.mounted) return;
+    }
+    await ref.read(inspectionProvider.notifier).finishPanoramaCapture();
   }
 }
 
